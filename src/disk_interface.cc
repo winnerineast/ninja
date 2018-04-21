@@ -70,7 +70,7 @@ TimeStamp TimeStampFromFileTime(const FILETIME& filetime) {
 
 TimeStamp StatSingleFile(const string& path, string* err) {
   WIN32_FILE_ATTRIBUTE_DATA attrs;
-  if (!GetFileAttributesEx(path.c_str(), GetFileExInfoStandard, &attrs)) {
+  if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs)) {
     DWORD win_err = GetLastError();
     if (win_err == ERROR_FILE_NOT_FOUND || win_err == ERROR_PATH_NOT_FOUND)
       return 0;
@@ -112,6 +112,11 @@ bool StatAllFilesInDir(const string& dir, map<string, TimeStamp>* stamps,
   }
   do {
     string lowername = ffd.cFileName;
+    if (lowername == "..") {
+      // Seems to just copy the timestamp for ".." from ".", which is wrong.
+      // This is the case at least on NTFS under Windows 7.
+      continue;
+    }
     transform(lowername.begin(), lowername.end(), lowername.begin(), ::tolower);
     stamps->insert(make_pair(lowername,
                              TimeStampFromFileTime(ffd.ftLastWriteTime)));
@@ -164,6 +169,11 @@ TimeStamp RealDiskInterface::Stat(const string& path, string* err) const {
 
   string dir = DirName(path);
   string base(path.substr(dir.size() ? dir.size() + 1 : 0));
+  if (base == "..") {
+    // StatAllFilesInDir does not report any information for base = "..".
+    base = ".";
+    dir = path;
+  }
 
   transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
   transform(base.begin(), base.end(), base.begin(), ::tolower);
@@ -195,11 +205,12 @@ TimeStamp RealDiskInterface::Stat(const string& path, string* err) const {
   return ((int64_t)st.st_mtimespec.tv_sec * 1000000000LL +
           st.st_mtimespec.tv_nsec);
 #elif (_POSIX_C_SOURCE >= 200809L || _XOPEN_SOURCE >= 700 || defined(_BSD_SOURCE) || defined(_SVID_SOURCE) || \
-       defined(__BIONIC__))
+       defined(__BIONIC__) || (defined (__SVR4) && defined (__sun)))
   // For glibc, see "Timestamp files" in the Notes of http://www.kernel.org/doc/man-pages/online/pages/man2/stat.2.html
   // newlib, uClibc and musl follow the kernel (or Cygwin) headers and define the right macro values above.
   // For bsd, see https://github.com/freebsd/freebsd/blob/master/sys/sys/stat.h and similar
   // For bionic, C and POSIX API is always enabled.
+  // For solaris, see https://docs.oracle.com/cd/E88353_01/html/E37841/stat-2.html.
   return (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
 #else
   return (int64_t)st.st_mtime * 1000000000LL + st.st_mtimensec;
