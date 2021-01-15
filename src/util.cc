@@ -45,14 +45,20 @@
 #elif defined(__SVR4) && defined(__sun)
 #include <unistd.h>
 #include <sys/loadavg.h>
-#elif defined(_AIX)
+#elif defined(_AIX) && !defined(__PASE__)
 #include <libperfstat.h>
 #elif defined(linux) || defined(__GLIBC__)
 #include <sys/sysinfo.h>
 #endif
 
+#if defined(__FreeBSD__)
+#include <sys/cpuset.h>
+#endif
+
 #include "edit_distance.h"
 #include "metrics.h"
+
+using namespace std;
 
 void Fatal(const char* msg, ...) {
   va_list ap;
@@ -197,7 +203,7 @@ bool CanonicalizePath(char* path, size_t* len, uint64_t* slash_bits,
       case '\\':
         bits |= bits_mask;
         *c = '/';
-        // Intentional fallthrough.
+        NINJA_FALLTHROUGH;
       case '/':
         bits_mask <<= 1;
     }
@@ -346,9 +352,19 @@ int ReadFile(const string& path, string* contents, string* err) {
     return -errno;
   }
 
+  struct stat st;
+  if (fstat(fileno(f), &st) < 0) {
+    err->assign(strerror(errno));
+    fclose(f);
+    return -errno;
+  }
+
+  // +1 is for the resize in ManifestParser::Load
+  contents->reserve(st.st_size + 1);
+
   char buf[64 << 10];
   size_t len;
-  while ((len = fread(buf, 1, sizeof(buf), f)) > 0) {
+  while (!feof(f) && (len = fread(buf, 1, sizeof(buf), f)) > 0) {
     contents->append(buf, len);
   }
   if (ferror(f)) {
@@ -432,8 +448,12 @@ string GetLastErrorString() {
   return msg;
 }
 
-void Win32Fatal(const char* function) {
-  Fatal("%s: %s", function, GetLastErrorString().c_str());
+void Win32Fatal(const char* function, const char* hint) {
+  if (hint) {
+    Fatal("%s: %s (%s)", function, GetLastErrorString().c_str(), hint);
+  } else {
+    Fatal("%s: %s", function, GetLastErrorString().c_str());
+  }
 }
 #endif
 
@@ -467,10 +487,53 @@ string StripAnsiEscapeCodes(const string& in) {
 
 int GetProcessorCount() {
 #ifdef _WIN32
-  SYSTEM_INFO info;
-  GetNativeSystemInfo(&info);
-  return info.dwNumberOfProcessors;
+#ifndef _WIN64
+  // Need to use GetLogicalProcessorInformationEx to get real core count on
+  // machines with >64 cores. See https://stackoverflow.com/a/31209344/21475
+  DWORD len = 0;
+  if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len)
+        && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+    std::vector<char> buf(len);
+    int cores = 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore,
+          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+            buf.data()), &len)) {
+      for (DWORD i = 0; i < len; ) {
+        auto info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+            buf.data() + i);
+        if (info->Relationship == RelationProcessorCore &&
+            info->Processor.GroupCount == 1) {
+          for (KAFFINITY core_mask = info->Processor.GroupMask[0].Mask;
+               core_mask; core_mask >>= 1) {
+            cores += (core_mask & 1);
+          }
+        }
+        i += info->Size;
+      }
+      if (cores != 0) {
+        return cores;
+      }
+    }
+  }
+#endif
+  return GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
 #else
+  // The number of exposed processors might not represent the actual number of
+  // processors threads can run on. This happens when a CPU set limitation is
+  // active, see https://github.com/ninja-build/ninja/issues/1278
+#if defined(__FreeBSD__)
+  cpuset_t mask;
+  CPU_ZERO(&mask);
+  if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof(mask),
+    &mask) == 0) {
+    return CPU_COUNT(&mask);
+  }
+#elif defined(CPU_COUNT)
+  cpu_set_t set;
+  if (sched_getaffinity(getpid(), sizeof(set), &set) == 0) {
+    return CPU_COUNT(&set);
+  }
+#endif
   return sysconf(_SC_NPROCESSORS_ONLN);
 #endif
 }
@@ -541,6 +604,10 @@ double GetLoadAverage() {
 
   return posix_compatible_load;
 }
+#elif defined(__PASE__)
+double GetLoadAverage() {
+  return -0.0f;
+}
 #elif defined(_AIX)
 double GetLoadAverage() {
   perfstat_cpu_total_t cpu_stats;
@@ -551,7 +618,7 @@ double GetLoadAverage() {
   // Calculation taken from comment in libperfstats.h
   return double(cpu_stats.loadavg[0]) / double(1 << SBITS);
 }
-#elif defined(__UCLIBC__)
+#elif defined(__UCLIBC__) || (defined(__BIONIC__) && __ANDROID_API__ < 29)
 double GetLoadAverage() {
   struct sysinfo si;
   if (sysinfo(&si) != 0)
@@ -571,9 +638,15 @@ double GetLoadAverage() {
 #endif // _WIN32
 
 string ElideMiddle(const string& str, size_t width) {
+  switch (width) {
+      case 0: return "";
+      case 1: return ".";
+      case 2: return "..";
+      case 3: return "...";
+  }
   const int kMargin = 3;  // Space for "...".
   string result = str;
-  if (result.size() + kMargin > width) {
+  if (result.size() > width) {
     size_t elide_size = (width - kMargin) / 2;
     result = result.substr(0, elide_size)
       + "..."

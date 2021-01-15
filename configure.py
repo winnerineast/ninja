@@ -60,6 +60,8 @@ class Platform(object):
             self._platform = 'netbsd'
         elif self._platform.startswith('aix'):
             self._platform = 'aix'
+        elif self._platform.startswith('os400'):
+            self._platform = 'os400'
         elif self._platform.startswith('dragonfly'):
             self._platform = 'dragonfly'
 
@@ -97,8 +99,11 @@ class Platform(object):
     def is_aix(self):
         return self._platform == 'aix'
 
+    def is_os400_pase(self):
+        return self._platform == 'os400' or os.uname().sysname.startswith('OS400')
+
     def uses_usr_local(self):
-        return self._platform in ('freebsd', 'openbsd', 'bitrig', 'dragonfly')
+        return self._platform in ('freebsd', 'openbsd', 'bitrig', 'dragonfly', 'netbsd')
 
     def supports_ppoll(self):
         return self._platform in ('freebsd', 'linux', 'openbsd', 'bitrig',
@@ -264,7 +269,7 @@ if configure_env:
     n.variable('configure_env', config_str + '$ ')
 n.newline()
 
-CXX = configure_env.get('CXX', 'g++')
+CXX = configure_env.get('CXX', 'c++')
 objext = '.o'
 if platform.is_msvc():
     CXX = 'cl'
@@ -351,11 +356,16 @@ else:
     except:
         pass
     if platform.is_mingw():
-        cflags += ['-D_WIN32_WINNT=0x0501']
+        cflags += ['-D_WIN32_WINNT=0x0601', '-D__USE_MINGW_ANSI_STDIO=1']
     ldflags = ['-L$builddir']
     if platform.uses_usr_local():
         cflags.append('-I/usr/local/include')
         ldflags.append('-L/usr/local/lib')
+    if platform.is_aix():
+        # printf formats for int64_t, uint64_t; large file support
+        cflags.append('-D__STDC_FORMAT_MACROS')
+        cflags.append('-D_LARGE_FILES')
+
 
 libs = []
 
@@ -409,7 +419,7 @@ n.newline()
 
 if platform.is_msvc():
     n.rule('cxx',
-        command='$cxx $cflags -c $in /Fo$out',
+        command='$cxx $cflags -c $in /Fo$out /Fd' + built('$pdb'),
         description='CXX $out',
         deps='msvc'  # /showIncludes is included in $cflags.
     )
@@ -427,7 +437,7 @@ if host.is_msvc():
            description='LIB $out')
 elif host.is_mingw():
     n.rule('ar',
-           command='cmd /c $ar cqs $out.tmp $in && move /Y $out.tmp $out',
+           command='$ar crs $out $in',
            description='AR $out')
 else:
     n.rule('ar',
@@ -480,6 +490,9 @@ else:
 n.newline()
 
 n.comment('Core source files all build into ninja library.')
+cxxvariables = []
+if platform.is_msvc():
+    cxxvariables = [('pdb', 'ninja.pdb')]
 for name in ['build',
              'build_log',
              'clean',
@@ -488,6 +501,8 @@ for name in ['build',
              'depfile_parser',
              'deps_log',
              'disk_interface',
+             'dyndep',
+             'dyndep_parser',
              'edit_distance',
              'eval_env',
              'graph',
@@ -496,19 +511,20 @@ for name in ['build',
              'line_printer',
              'manifest_parser',
              'metrics',
+             'parser',
              'state',
              'string_piece_util',
              'util',
              'version']:
-    objs += cxx(name)
+    objs += cxx(name, variables=cxxvariables)
 if platform.is_windows():
     for name in ['subprocess-win32',
                  'includes_normalize-win32',
                  'msvc_helper-win32',
                  'msvc_helper_main-win32']:
-        objs += cxx(name)
+        objs += cxx(name, variables=cxxvariables)
     if platform.is_msvc():
-        objs += cxx('minidump-win32')
+        objs += cxx('minidump-win32', variables=cxxvariables)
     objs += cc('getopt')
 else:
     objs += cxx('subprocess-posix')
@@ -525,13 +541,13 @@ if platform.is_msvc():
 else:
     libs.append('-lninja')
 
-if platform.is_aix():
+if platform.is_aix() and not platform.is_os400_pase():
     libs.append('-lperfstat')
 
 all_targets = []
 
 n.comment('Main executable is library plus main() function.')
-objs = cxx('ninja')
+objs = cxx('ninja', variables=cxxvariables)
 ninja = n.build(binary('ninja'), 'link', objs, implicit=ninja_lib,
                 variables=[('libs', libs)])
 n.newline()
@@ -546,6 +562,8 @@ if options.bootstrap:
 n.comment('Tests all build into ninja_test executable.')
 
 objs = []
+if platform.is_msvc():
+    cxxvariables = [('pdb', 'ninja_test.pdb')]
 
 for name in ['build_log_test',
              'build_test',
@@ -553,6 +571,7 @@ for name in ['build_log_test',
              'clparser_test',
              'depfile_parser_test',
              'deps_log_test',
+             'dyndep_parser_test',
              'disk_interface_test',
              'edit_distance_test',
              'graph_test',
@@ -564,10 +583,10 @@ for name in ['build_log_test',
              'subprocess_test',
              'test',
              'util_test']:
-    objs += cxx(name)
+    objs += cxx(name, variables=cxxvariables)
 if platform.is_windows():
     for name in ['includes_normalize_test', 'msvc_helper_test']:
-        objs += cxx(name)
+        objs += cxx(name, variables=cxxvariables)
 
 ninja_test = n.build(binary('ninja_test'), 'link', objs, implicit=ninja_lib,
                      variables=[('libs', libs)])
@@ -577,13 +596,20 @@ all_targets += ninja_test
 
 n.comment('Ancillary executables.')
 
+if platform.is_aix() and '-maix64' not in ldflags:
+    # Both hash_collision_bench and manifest_parser_perftest require more
+    # memory than will fit in the standard 32-bit AIX shared stack/heap (256M)
+    libs.append('-Wl,-bmaxdata:0x80000000')
+
 for name in ['build_log_perftest',
              'canon_perftest',
              'depfile_parser_perftest',
              'hash_collision_bench',
              'manifest_parser_perftest',
              'clparser_perftest']:
-  objs = cxx(name)
+  if platform.is_msvc():
+    cxxvariables = [('pdb', name + '.pdb')]
+  objs = cxx(name, variables=cxxvariables)
   all_targets += n.build(binary(name), 'link', objs,
                          implicit=ninja_lib, variables=[('libs', libs)])
 
@@ -628,7 +654,7 @@ n.rule('doxygen_mainpage',
        command='$doxygen_mainpage_generator $in > $out',
        description='DOXYGEN_MAINPAGE $out')
 mainpage = n.build(built('doxygen_mainpage'), 'doxygen_mainpage',
-                   ['README', 'COPYING'],
+                   ['README.md', 'COPYING'],
                    implicit=['$doxygen_mainpage_generator'])
 n.build('doxygen', 'doxygen', doc('doxygen.config'),
         implicit=mainpage)

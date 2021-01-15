@@ -21,6 +21,8 @@
 
 #include "util.h"
 
+using namespace std;
+
 Subprocess::Subprocess(bool use_console) : child_(NULL) , overlapped_(),
                                            is_reading_(false),
                                            use_console_(use_console) {
@@ -125,7 +127,19 @@ bool Subprocess::Start(SubprocessSet* set, const string& command) {
           "specified.\n";
       return true;
     } else {
-      Win32Fatal("CreateProcess");    // pass all other errors to Win32Fatal
+      fprintf(stderr, "\nCreateProcess failed. Command attempted:\n\"%s\"\n",
+              command.c_str());
+      const char* hint = NULL;
+      // ERROR_INVALID_PARAMETER means the command line was formatted
+      // incorrectly. This can be caused by a command line being too long or
+      // leading whitespace in the command. Give extra context for this case.
+      if (error == ERROR_INVALID_PARAMETER) {
+        if (command.length() > 0 && (command[0] == ' ' || command[0] == '\t'))
+          hint = "command contains leading whitespace";
+        else
+          hint = "is the command line too long?";
+      }
+      Win32Fatal("CreateProcess", hint);
     }
   }
 

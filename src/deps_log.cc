@@ -20,12 +20,17 @@
 #include <string.h>
 #ifndef _WIN32
 #include <unistd.h>
+#elif defined(_MSC_VER) && (_MSC_VER < 1900)
+typedef __int32 int32_t;
+typedef unsigned __int32 uint32_t;
 #endif
 
 #include "graph.h"
 #include "metrics.h"
 #include "state.h"
 #include "util.h"
+
+using namespace std;
 
 // The version is stored as 4 bytes after the signature and also serves as a
 // byte order mark. Signature and version combined are 16 bytes long.
@@ -45,35 +50,10 @@ bool DepsLog::OpenForWrite(const string& path, string* err) {
     if (!Recompact(path, err))
       return false;
   }
-  
-  file_ = fopen(path.c_str(), "ab");
-  if (!file_) {
-    *err = strerror(errno);
-    return false;
-  }
-  // Set the buffer size to this and flush the file buffer after every record
-  // to make sure records aren't written partially.
-  setvbuf(file_, NULL, _IOFBF, kMaxRecordSize + 1);
-  SetCloseOnExec(fileno(file_));
 
-  // Opening a file in append mode doesn't set the file pointer to the file's
-  // end on Windows. Do that explicitly.
-  fseek(file_, 0, SEEK_END);
-
-  if (ftell(file_) == 0) {
-    if (fwrite(kFileSignature, sizeof(kFileSignature) - 1, 1, file_) < 1) {
-      *err = strerror(errno);
-      return false;
-    }
-    if (fwrite(&kCurrentVersion, 4, 1, file_) < 1) {
-      *err = strerror(errno);
-      return false;
-    }
-  }
-  if (fflush(file_) != 0) {
-    *err = strerror(errno);
-    return false;
-  }
+  assert(!file_);
+  file_path_ = path;  // we don't actually open the file right now, but will do
+                      // so on the first write attempt
   return true;
 }
 
@@ -129,6 +109,10 @@ bool DepsLog::RecordDeps(Node* node, TimeStamp mtime,
     errno = ERANGE;
     return false;
   }
+
+  if (!OpenForWriteIfNeeded()) {
+    return false;
+  }
   size |= 0x80000000;  // Deps record: set high bit.
   if (fwrite(&size, 4, 1, file_) < 1)
     return false;
@@ -159,20 +143,21 @@ bool DepsLog::RecordDeps(Node* node, TimeStamp mtime,
 }
 
 void DepsLog::Close() {
+  OpenForWriteIfNeeded();  // create the file even if nothing has been recorded
   if (file_)
     fclose(file_);
   file_ = NULL;
 }
 
-bool DepsLog::Load(const string& path, State* state, string* err) {
+LoadStatus DepsLog::Load(const string& path, State* state, string* err) {
   METRIC_RECORD(".ninja_deps load");
   char buf[kMaxRecordSize + 1];
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) {
     if (errno == ENOENT)
-      return true;
+      return LOAD_NOT_FOUND;
     *err = strerror(errno);
-    return false;
+    return LOAD_ERROR;
   }
 
   bool valid_header = true;
@@ -193,7 +178,7 @@ bool DepsLog::Load(const string& path, State* state, string* err) {
     unlink(path.c_str());
     // Don't report this as a failure.  An empty deps log will cause
     // us to rebuild the outputs anyway.
-    return true;
+    return LOAD_SUCCESS;
   }
 
   long offset;
@@ -281,12 +266,12 @@ bool DepsLog::Load(const string& path, State* state, string* err) {
     fclose(f);
 
     if (!Truncate(path, offset, err))
-      return false;
+      return LOAD_ERROR;
 
     // The truncate succeeded; we'll just report the load error as a
     // warning because the build can proceed.
     *err += "; recovering";
-    return true;
+    return LOAD_SUCCESS;
   }
 
   fclose(f);
@@ -299,7 +284,7 @@ bool DepsLog::Load(const string& path, State* state, string* err) {
     needs_recompaction_ = true;
   }
 
-  return true;
+  return LOAD_SUCCESS;
 }
 
 DepsLog::Deps* DepsLog::GetDeps(Node* node) {
@@ -328,7 +313,7 @@ bool DepsLog::Recompact(const string& path, string* err) {
   // will refer to the ordering in new_log, not in the current log.
   for (vector<Node*>::iterator i = nodes_.begin(); i != nodes_.end(); ++i)
     (*i)->set_id(-1);
-  
+
   // Write out all deps again.
   for (int old_id = 0; old_id < (int)deps_.size(); ++old_id) {
     Deps* deps = deps_[old_id];
@@ -393,10 +378,14 @@ bool DepsLog::RecordId(Node* node) {
     errno = ERANGE;
     return false;
   }
+
+  if (!OpenForWriteIfNeeded()) {
+    return false;
+  }
   if (fwrite(&size, 4, 1, file_) < 1)
     return false;
   if (fwrite(node->path().data(), path_size, 1, file_) < 1) {
-    assert(node->path().size() > 0);
+    assert(!node->path().empty());
     return false;
   }
   if (padding && fwrite("\0\0", padding, 1, file_) < 1)
@@ -411,5 +400,39 @@ bool DepsLog::RecordId(Node* node) {
   node->set_id(id);
   nodes_.push_back(node);
 
+  return true;
+}
+
+bool DepsLog::OpenForWriteIfNeeded() {
+  if (file_path_.empty()) {
+    return true;
+  }
+  file_ = fopen(file_path_.c_str(), "ab");
+  if (!file_) {
+    return false;
+  }
+  // Set the buffer size to this and flush the file buffer after every record
+  // to make sure records aren't written partially.
+  if (setvbuf(file_, NULL, _IOFBF, kMaxRecordSize + 1) != 0) {
+    return false;
+  }
+  SetCloseOnExec(fileno(file_));
+
+  // Opening a file in append mode doesn't set the file pointer to the file's
+  // end on Windows. Do that explicitly.
+  fseek(file_, 0, SEEK_END);
+
+  if (ftell(file_) == 0) {
+    if (fwrite(kFileSignature, sizeof(kFileSignature) - 1, 1, file_) < 1) {
+      return false;
+    }
+    if (fwrite(&kCurrentVersion, 4, 1, file_) < 1) {
+      return false;
+    }
+  }
+  if (fflush(file_) != 0) {
+    return false;
+  }
+  file_path_.clear();
   return true;
 }
